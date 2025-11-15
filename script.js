@@ -20,6 +20,7 @@ const remoteVideo = document.getElementById('remote-video');
 const muteAudioBtn = document.getElementById('mute-audio');
 const muteVideoBtn = document.getElementById('mute-video');
 const endCallBtn = document.getElementById('end-call');
+const switchCameraBtn = document.getElementById('switch-camera');
 
 // Переменные состояния
 let currentRoom = null;
@@ -34,13 +35,20 @@ let userId = generateUserId();
 let isUserActive = true;
 let callStartTime = null;
 let callTimerInterval = null;
+let audioContext = null;
+let volumeAnalyser = null;
+
+// Переменные для управления камерами
+let currentCamera = 'user';
+let availableCameras = [];
+let currentVideoTrack = null;
 
 // Генерация уникального ID пользователя
 function generateUserId() {
     return 'user_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
 }
 
-// Улучшенная конфигурация STUN/TURN серверов
+// Конфигурация STUN/TURN серверов
 const configuration = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -55,6 +63,11 @@ const configuration = {
             urls: 'turn:openrelay.metered.ca:443',
             username: 'openrelayproject',
             credential: 'openrelayproject'
+        },
+        {
+            urls: 'turn:turn.anyfirewall.com:443?transport=tcp',
+            username: 'webrtc',
+            credential: 'webrtc'
         }
     ],
     iceTransportPolicy: 'all',
@@ -68,7 +81,6 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function initializeApp() {
-    // Обработчик отправки формы
     roomForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         
@@ -82,39 +94,35 @@ function initializeApp() {
         await joinRoom(roomNumber);
     });
 
-    // Обработчик отмены ожидания
     cancelWaitingBtn.addEventListener('click', () => {
         leaveRoom();
         showScreen(loginScreen);
     });
 
-    // Обработчики кнопок управления звонком
     muteAudioBtn.addEventListener('click', toggleAudio);
     muteVideoBtn.addEventListener('click', toggleVideo);
     endCallBtn.addEventListener('click', endCall);
+    
+    if (switchCameraBtn) {
+        switchCameraBtn.addEventListener('click', switchCamera);
+    }
 
-    // Обработчик ввода номера комнаты
     roomNumberInput.addEventListener('input', (e) => {
         e.target.value = e.target.value.replace(/\D/g, '').slice(0, 14);
     });
 
-    // Отслеживание активности пользователя
     setupActivityTracking();
-    
-    // Периодическая очистка неактивных комнат
     startRoomCleanupInterval();
 }
 
 // Настройка отслеживания активности
 function setupActivityTracking() {
-    // События активности пользователя
     const activityEvents = ['mousedown', 'mousemove', 'keypress', 'scroll', 'touchstart', 'click'];
     
     activityEvents.forEach(event => {
         document.addEventListener(event, updateActivity, true);
     });
 
-    // Проверка активности каждые 30 секунд
     activityCheckInterval = setInterval(checkActivity, 30000);
 }
 
@@ -123,7 +131,6 @@ function updateActivity() {
     lastActivityTime = Date.now();
     isUserActive = true;
     
-    // Обновляем активность в комнате если мы в ней
     if (currentRoom) {
         updateUserActivity();
     }
@@ -132,13 +139,12 @@ function updateActivity() {
 // Проверка активности
 function checkActivity() {
     const inactiveTime = Date.now() - lastActivityTime;
-    const inactiveThreshold = 5 * 60 * 1000; // 5 минут
+    const inactiveThreshold = 5 * 60 * 1000;
     
     if (inactiveTime > inactiveThreshold && isUserActive) {
         isUserActive = false;
         console.log('Пользователь неактивен более 5 минут');
         
-        // Если мы в комнате, выходим из нее
         if (currentRoom) {
             showError('Вы были неактивны более 5 минут. Комната будет удалена.');
             endCall();
@@ -150,7 +156,174 @@ function checkActivity() {
 function startRoomCleanupInterval() {
     setInterval(async () => {
         await cleanupInactiveRooms();
-    }, 2 * 60 * 1000); // Проверка каждые 2 минуты
+    }, 2 * 60 * 1000);
+}
+
+// Функция получения списка доступных камер
+async function getAvailableCameras() {
+    try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter(device => device.kind === 'videoinput');
+        
+        console.log('Доступные камеры:', videoDevices);
+        return videoDevices;
+    } catch (error) {
+        console.error('Ошибка получения списка камер:', error);
+        return [];
+    }
+}
+
+// Функция переключения камеры
+async function switchCamera() {
+    if (!localStream) return;
+    
+    try {
+        console.log('Переключаем камеру...');
+        
+        const currentVideoTracks = localStream.getVideoTracks();
+        if (currentVideoTracks.length === 0) {
+            console.log('Нет активного видео трека');
+            return;
+        }
+        
+        currentVideoTracks.forEach(track => {
+            track.stop();
+            localStream.removeTrack(track);
+        });
+        
+        let nextCamera = currentCamera === 'user' ? 'environment' : 'user';
+        
+        const cameras = await getAvailableCameras();
+        if (cameras.length < 2) {
+            console.log('Доступна только одна камера');
+            showNotification('Доступна только одна камера', 'info');
+            return;
+        }
+        
+        const newStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                facingMode: nextCamera,
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+                frameRate: { ideal: 30 }
+            },
+            audio: false
+        });
+        
+        const newVideoTrack = newStream.getVideoTracks()[0];
+        localStream.addTrack(newVideoTrack);
+        currentVideoTrack = newVideoTrack;
+        currentCamera = nextCamera;
+        
+        localVideo.srcObject = localStream;
+        
+        if (peerConnection) {
+            const senders = peerConnection.getSenders();
+            const videoSender = senders.find(sender => 
+                sender.track && sender.track.kind === 'video'
+            );
+            
+            if (videoSender) {
+                await videoSender.replaceTrack(newVideoTrack);
+                console.log('Видео трек заменен в PeerConnection');
+            }
+        }
+        
+        updateSwitchCameraButton();
+        
+        console.log('Камера переключена на:', currentCamera);
+        showNotification(`Камера переключена на ${currentCamera === 'user' ? 'фронтальную' : 'заднюю'}`, 'info');
+        
+    } catch (error) {
+        console.error('Ошибка переключения камеры:', error);
+        showError('Не удалось переключить камеру: ' + error.message);
+        await switchCameraAlternative();
+    }
+}
+
+// Альтернативный метод переключения камеры
+async function switchCameraAlternative() {
+    try {
+        const cameras = await getAvailableCameras();
+        if (cameras.length < 2) {
+            showNotification('Доступна только одна камера', 'info');
+            return;
+        }
+        
+        const currentDeviceId = currentVideoTrack?.getSettings().deviceId;
+        const currentIndex = cameras.findIndex(cam => cam.deviceId === currentDeviceId);
+        const nextIndex = (currentIndex + 1) % cameras.length;
+        const nextCamera = cameras[nextIndex];
+        
+        const currentVideoTracks = localStream.getVideoTracks();
+        currentVideoTracks.forEach(track => {
+            track.stop();
+            localStream.removeTrack(track);
+        });
+        
+        const newStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                deviceId: { exact: nextCamera.deviceId },
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+                frameRate: { ideal: 30 }
+            },
+            audio: false
+        });
+        
+        const newVideoTrack = newStream.getVideoTracks()[0];
+        localStream.addTrack(newVideoTrack);
+        currentVideoTrack = newVideoTrack;
+        
+        localVideo.srcObject = localStream;
+        
+        if (peerConnection) {
+            const senders = peerConnection.getSenders();
+            const videoSender = senders.find(sender => 
+                sender.track && sender.track.kind === 'video'
+            );
+            
+            if (videoSender) {
+                await videoSender.replaceTrack(newVideoTrack);
+            }
+        }
+        
+        const cameraLabel = nextCamera.label.toLowerCase();
+        if (cameraLabel.includes('back') || cameraLabel.includes('rear') || cameraLabel.includes('environment')) {
+            currentCamera = 'environment';
+        } else {
+            currentCamera = 'user';
+        }
+        
+        updateSwitchCameraButton();
+        
+        console.log('Камера переключена альтернативным методом');
+        showNotification(`Камера переключена на ${currentCamera === 'user' ? 'фронтальную' : 'заднюю'}`, 'info');
+        
+    } catch (error) {
+        console.error('Ошибка альтернативного переключения камеры:', error);
+        showError('Не удалось переключить камеру');
+    }
+}
+
+// Обновление иконки кнопки переключения камеры
+function updateSwitchCameraButton() {
+    if (!switchCameraBtn) return;
+    
+    const icon = switchCameraBtn.querySelector('svg');
+    if (icon) {
+        icon.innerHTML = '';
+        
+        if (currentCamera === 'user') {
+            icon.innerHTML = `
+                <path d="M12 12c1.65 0 3-1.35 3-3s-1.35-3-3-3-3 1.35-3 3 1.35 3 3 3zm0-4c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm6 8.58c0-2.5-3.97-3.58-6-3.58s-6 1.08-6 3.58V18h12v-1.42zM8.48 16c.74-.51 2.23-1 3.52-1s2.78.49 3.52 1H8.48z"/>
+            `;
+        } else {
+            icon.innerHTML = `
+                <path d="M12 15c1.66 0 2.99-1.34 2.99-3L15 6c0-1.66-1.34-3-3-3S9 4.34 9 6v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 15 6.7 12H5c0 3.42 2.72 6.23 6 6.72V22h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/>
+            `;
+        }
+    }
 }
 
 // Функция присоединения к комнате
@@ -159,10 +332,8 @@ async function joinRoom(roomNumber) {
         currentRoom = roomNumber;
         currentRoomSpan.textContent = roomNumber;
         
-        // Сначала проверяем и очищаем старые комнаты
         await cleanupInactiveRooms();
         
-        // Проверяем существование комнаты
         const { data: existingRoom, error } = await supabase
             .from('rooms')
             .select('*')
@@ -174,15 +345,12 @@ async function joinRoom(roomNumber) {
         }
         
         if (existingRoom) {
-            // Проверяем, не устарела ли комната
             if (isRoomExpired(existingRoom)) {
-                // Удаляем устаревшую комнату и создаем новую
                 await supabase
                     .from('rooms')
                     .delete()
                     .eq('room_number', roomNumber);
                 
-                // Также очищаем signaling данные
                 await supabase
                     .from('signaling')
                     .delete()
@@ -192,7 +360,6 @@ async function joinRoom(roomNumber) {
                 await setupMedia();
                 await createNewRoom();
             } else {
-                // Комната существует - присоединяемся как второй участник
                 if (existingRoom.participants >= 2) {
                     showError('Комната уже заполнена. Максимум 2 участника.');
                     return;
@@ -202,7 +369,6 @@ async function joinRoom(roomNumber) {
                 await joinExistingRoom(existingRoom);
             }
         } else {
-            // Комната не существует - создаем новую
             isCaller = true;
             await setupMedia();
             await createNewRoom();
@@ -223,7 +389,7 @@ function isRoomExpired(room) {
     const lastActivity = new Date(room.last_activity);
     const now = new Date();
     const diffMinutes = (now - lastActivity) / (1000 * 60);
-    return diffMinutes > 10; // Комната устарела через 10 минут
+    return diffMinutes > 10;
 }
 
 // Очистка неактивных комнат
@@ -247,7 +413,6 @@ async function cleanupInactiveRooms() {
                     .delete()
                     .eq('room_number', room.room_number);
                 
-                // Также очищаем signaling данные
                 await supabase
                     .from('signaling')
                     .delete()
@@ -279,16 +444,12 @@ async function createNewRoom() {
     
     if (error) throw error;
     
-    // Подписываемся на изменения комнаты
     subscribeToRoomChanges();
-    
-    // Запускаем мониторинг активности комнаты
     startRoomActivityMonitoring();
 }
 
 // Функция присоединения к существующей комнате
 async function joinExistingRoom(room) {
-    // Обновляем количество участников и добавляем пользователя
     const updatedUserIds = [...(room.user_ids || []), userId];
     
     const { error } = await supabase
@@ -302,16 +463,12 @@ async function joinExistingRoom(room) {
     
     if (error) throw error;
     
-    // Подписываемся на изменения комнаты
     subscribeToRoomChanges();
-    
-    // Запускаем мониторинг активности комнаты
     startRoomActivityMonitoring();
 }
 
 // Мониторинг активности комнаты
 function startRoomActivityMonitoring() {
-    // Обновляем активность каждую минуту
     const activityInterval = setInterval(async () => {
         if (currentRoom && isUserActive) {
             await updateUserActivity();
@@ -356,17 +513,14 @@ function subscribeToRoomChanges() {
                 
                 if (payload.eventType === 'UPDATE') {
                     if (payload.new.participants === 2 && isCaller) {
-                        // Второй участник присоединился - начинаем звонок
                         await startCall();
                     }
                     
-                    // Проверяем, не удалена ли комната системой очистки
                     if (payload.new.participants === 0) {
                         showError('Комната была автоматически удалена из-за неактивности');
                         endCall();
                     }
                 } else if (payload.eventType === 'DELETE') {
-                    // Комната удалена - завершаем звонок
                     if (callScreen.classList.contains('active')) {
                         showError('Комната была удалена');
                         endCall();
@@ -386,98 +540,198 @@ function subscribeToRoomChanges() {
     signalingChannels.push(roomChannel);
 }
 
-// Функция настройки медиа (камера и микрофон)
+// Функция настройки медиа
 async function setupMedia() {
     try {
-        // Запрашиваем разрешение только на аудио сначала
-        const audioStream = await navigator.mediaDevices.getUserMedia({
+        console.log('Запрашиваем доступ к микрофону и камере...');
+        
+        availableCameras = await getAvailableCameras();
+        console.log('Доступные камеры:', availableCameras.length);
+        
+        localStream = await navigator.mediaDevices.getUserMedia({
             audio: {
                 echoCancellation: true,
                 noiseSuppression: true,
                 autoGainControl: true,
+                googEchoCancellation: true,
+                googAutoGainControl: true,
+                googNoiseSuppression: true,
+                googHighpassFilter: true,
                 channelCount: 1,
                 sampleRate: 48000,
-                sampleSize: 16
+                sampleSize: 16,
+                latency: 0.01
             },
-            video: false
-        });
-
-        // Затем запрашиваем видео
-        const videoStream = await navigator.mediaDevices.getUserMedia({
             video: {
+                facingMode: 'user',
                 width: { ideal: 1280 },
                 height: { ideal: 720 },
                 frameRate: { ideal: 30 }
             }
         });
 
-        // Объединяем потоки
-        localStream = new MediaStream([
-            ...audioStream.getAudioTracks(),
-            ...videoStream.getVideoTracks()
-        ]);
+        currentVideoTrack = localStream.getVideoTracks()[0];
+        currentCamera = 'user';
+        
+        console.log('Медиаустройства получены успешно');
 
         localVideo.srcObject = localStream;
+        localVideo.muted = true;
+        localVideo.volume = 0;
         
-        console.log('Аудио треки:', localStream.getAudioTracks());
-        console.log('Видео треки:', localStream.getVideoTracks());
+        updateSwitchCameraButton();
+        
+        if (availableCameras.length > 1 && switchCameraBtn) {
+            switchCameraBtn.style.display = 'flex';
+        } else if (switchCameraBtn) {
+            switchCameraBtn.style.display = 'none';
+        }
+        
+        setupVolumeMeter();
+        await testAudioOutput();
         
     } catch (error) {
         console.error('Ошибка доступа к медиаустройствам:', error);
         
-        // Пробуем получить только аудио
         try {
+            console.log('Пробуем получить только аудио...');
             localStream = await navigator.mediaDevices.getUserMedia({
-                audio: true,
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true
+                },
                 video: false
             });
+            
             localVideo.srcObject = localStream;
+            localVideo.muted = true;
+            localVideo.volume = 0;
+            
+            if (switchCameraBtn) {
+                switchCameraBtn.style.display = 'none';
+            }
+            
+            setupVolumeMeter();
+            await testAudioOutput();
+            
             showError('Видео недоступно, но аудио работает');
         } catch (audioError) {
+            console.error('Не удалось получить доступ к микрофону:', audioError);
             showError('Не удалось получить доступ к камере и микрофону. Пожалуйста, разрешите доступ и обновите страницу.');
             throw error;
         }
     }
 }
 
+// Настройка визуализатора громкости
+function setupVolumeMeter() {
+    try {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioContext.createMediaStreamSource(localStream);
+        volumeAnalyser = audioContext.createAnalyser();
+        volumeAnalyser.fftSize = 256;
+        source.connect(volumeAnalyser);
+        
+        updateVolumeMeter();
+    } catch (error) {
+        console.warn('Не удалось настроить визуализатор громкости:', error);
+    }
+}
+
+// Обновление индикатора громкости
+function updateVolumeMeter() {
+    if (!volumeAnalyser) return;
+    
+    const dataArray = new Uint8Array(volumeAnalyser.frequencyBinCount);
+    volumeAnalyser.getByteFrequencyData(dataArray);
+    
+    let sum = 0;
+    for (let i = 0; i < dataArray.length; i++) {
+        sum += dataArray[i];
+    }
+    const average = sum / dataArray.length;
+    
+    const volumeLevel = document.querySelector('.volume-level');
+    if (volumeLevel) {
+        const height = Math.min(100, (average / 128) * 100);
+        volumeLevel.style.height = height + '%';
+        volumeLevel.style.background = height > 50 ? '#4ade80' : height > 20 ? '#f59e0b' : '#ef4444';
+    }
+    
+    requestAnimationFrame(updateVolumeMeter);
+}
+
+// Тестирование аудио вывода
+async function testAudioOutput() {
+    try {
+        const testAudio = new Audio();
+        testAudio.volume = 0.1;
+        
+        await testAudio.play().then(() => {
+            testAudio.pause();
+            console.log('Аудио вывод работает нормально');
+        }).catch(error => {
+            console.warn('Автовоспроизведение аудио заблокировано:', error);
+        });
+    } catch (error) {
+        console.warn('Тест аудио вывода не удался:', error);
+    }
+}
+
 // Функция начала звонка
 async function startCall() {
+    console.log('Начинаем звонок...');
     showScreen(callScreen);
     callRoomSpan.textContent = currentRoom;
     
-    // Запускаем таймер звонка
     startCallTimer();
     
     try {
-        // Создаем Peer Connection с улучшенной конфигурацией
         peerConnection = new RTCPeerConnection(configuration);
         
-        // Критически важные обработчики для аудио
         peerConnection.onnegotiationneeded = async () => {
             console.log('Требуется переnegotiation');
         };
 
-        // Добавляем локальный поток с проверкой треков
         localStream.getTracks().forEach(track => {
-            console.log('Добавляем трек:', track.kind, track.id, track.enabled);
+            console.log('Добавляем трек в PeerConnection:', track.kind, track.id);
             peerConnection.addTrack(track, localStream);
         });
 
-        // Обработчик получения удаленного потока
         peerConnection.ontrack = (event) => {
             console.log('Получен удаленный поток:', event.streams);
+            
             if (event.streams && event.streams[0]) {
-                remoteVideo.srcObject = event.streams[0];
+                const remoteStream = event.streams[0];
+                remoteVideo.srcObject = remoteStream;
                 
-                // Принудительно включаем звук для удаленного видео
-                remoteVideo.volume = 1.0;
                 remoteVideo.muted = false;
+                remoteVideo.volume = 1.0;
+                remoteVideo.setAttribute('playsinline', 'true');
                 
-                console.log('Удаленные треки:', event.streams[0].getTracks());
+                remoteVideo.play().then(() => {
+                    console.log('Удаленное видео запущено успешно');
+                    showNotification('Соединение установлено! Звук должен работать', 'success');
+                }).catch(error => {
+                    console.error('Ошибка воспроизведения удаленного видео:', error);
+                    remoteVideo.muted = true;
+                    remoteVideo.play().then(() => {
+                        console.log('Удаленное видео запущено в muted режиме');
+                        showNotification('Соединение установлено. Возможно, требуется взаимодействие для включения звука', 'info');
+                    });
+                });
+                
+                const audioTracks = remoteStream.getAudioTracks();
+                console.log('Аудио треки в удаленном потоке:', audioTracks);
+                
+                if (audioTracks.length === 0) {
+                    console.warn('В удаленном потоке нет аудио треков!');
+                    showNotification('Удаленный пользователь не передает звук', 'warning');
+                }
             }
         };
         
-        // Обработчик ICE кандидатов
         peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
                 console.log('Новый ICE кандидат');
@@ -487,11 +741,10 @@ async function startCall() {
             }
         };
         
-        // Обработчик изменения состояния соединения
         peerConnection.onconnectionstatechange = (event) => {
             console.log('Состояние соединения:', peerConnection.connectionState);
             if (peerConnection.connectionState === 'connected') {
-                console.log('Соединение установлено!');
+                console.log('PeerConnection соединен!');
                 showNotification('Соединение установлено!', 'success');
             } else if (peerConnection.connectionState === 'disconnected' || 
                       peerConnection.connectionState === 'failed') {
@@ -501,27 +754,26 @@ async function startCall() {
             }
         };
 
+        peerConnection.oniceconnectionstatechange = (event) => {
+            console.log('ICE состояние соединения:', peerConnection.iceConnectionState);
+        };
+
         if (isCaller) {
-            // Создаем предложение с аудио и видео
+            console.log('Создаем offer...');
             const offer = await peerConnection.createOffer({
                 offerToReceiveAudio: true,
                 offerToReceiveVideo: true
             });
             
-            console.log('Создан offer:', offer.type);
+            console.log('Offer создан, устанавливаем local description...');
             await peerConnection.setLocalDescription(offer);
             
-            // Сохраняем предложение в Supabase
             await saveOffer(offer);
-            
-            // Слушаем ответ
             listenForAnswer();
         } else {
-            // Слушаем предложение
             listenForOffer();
         }
         
-        // Слушаем ICE кандидаты
         listenForIceCandidates();
         
     } catch (error) {
@@ -632,7 +884,6 @@ async function handleOffer(offerData) {
                 sdp: offerData.sdp
             });
             
-            // Создаем ответ с обязательным аудио
             const answer = await peerConnection.createAnswer({
                 offerToReceiveAudio: true,
                 offerToReceiveVideo: true
@@ -640,7 +891,6 @@ async function handleOffer(offerData) {
             
             await peerConnection.setLocalDescription(answer);
             
-            // Сохраняем ответ в Supabase
             const { error } = await supabase
                 .from('signaling')
                 .insert([
@@ -740,7 +990,6 @@ function toggleAudio() {
             audioTrack.enabled = !audioTrack.enabled;
             muteAudioBtn.classList.toggle('muted', !audioTrack.enabled);
             
-            // Обновляем индикатор на видео
             const videoWrapper = localVideo.closest('.video-wrapper');
             if (videoWrapper) {
                 videoWrapper.classList.toggle('audio-muted', !audioTrack.enabled);
@@ -773,14 +1022,12 @@ function toggleVideo() {
 async function endCall() {
     console.log('Завершение звонка');
     
-    // Останавливаем таймер звонка
     if (callTimerInterval) {
         clearInterval(callTimerInterval);
         callTimerInterval = null;
     }
     callStartTime = null;
     
-    // Останавливаем медиапотоки
     if (localStream) {
         localStream.getTracks().forEach(track => {
             track.stop();
@@ -789,16 +1036,17 @@ async function endCall() {
         localStream = null;
     }
     
-    // Закрываем Peer Connection
     if (peerConnection) {
         peerConnection.close();
         peerConnection = null;
     }
     
-    // Выходим из комнаты
-    await leaveRoom();
+    if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+    }
     
-    // Показываем экран входа
+    await leaveRoom();
     showScreen(loginScreen);
 }
 
@@ -806,7 +1054,6 @@ async function endCall() {
 async function leaveRoom() {
     if (currentRoom) {
         try {
-            // Получаем текущее состояние комнаты
             const { data: room, error: fetchError } = await supabase
                 .from('rooms')
                 .select('*')
@@ -814,18 +1061,15 @@ async function leaveRoom() {
                 .single();
             
             if (!fetchError && room) {
-                // Убираем текущего пользователя из списка участников
                 const updatedUserIds = (room.user_ids || []).filter(id => id !== userId);
                 const updatedParticipants = Math.max(0, room.participants - 1);
                 
                 if (updatedParticipants === 0) {
-                    // Если участников не осталось - удаляем комнату
                     await supabase
                         .from('rooms')
                         .delete()
                         .eq('room_number', currentRoom);
                 } else {
-                    // Обновляем комнату с новыми данными
                     await supabase
                         .from('rooms')
                         .update({ 
@@ -837,7 +1081,6 @@ async function leaveRoom() {
                 }
             }
             
-            // Очищаем signaling данные
             await supabase
                 .from('signaling')
                 .delete()
@@ -847,13 +1090,10 @@ async function leaveRoom() {
             console.error('Ошибка при выходе из комнаты:', error);
         }
         
-        // Отписываемся от каналов
         cleanupSignalingChannels();
-        
         currentRoom = null;
     }
     
-    // Очищаем таймаут комнаты
     if (roomTimeout) {
         clearTimeout(roomTimeout);
         roomTimeout = null;
@@ -876,14 +1116,12 @@ function resetRoomTimeout() {
     
     roomTimeout = setTimeout(async () => {
         if (currentRoom && !callScreen.classList.contains('active')) {
-            // Удаляем комнату по таймауту
             try {
                 await supabase
                     .from('rooms')
                     .delete()
                     .eq('room_number', currentRoom);
                 
-                // Также очищаем signaling данные
                 await supabase
                     .from('signaling')
                     .delete()
@@ -895,7 +1133,7 @@ function resetRoomTimeout() {
                 console.error('Ошибка удаления комнаты по таймауту:', error);
             }
         }
-    }, 10 * 60 * 1000); // 10 минут
+    }, 10 * 60 * 1000);
 }
 
 // Функция показа экрана
@@ -919,18 +1157,14 @@ function showError(message) {
 
 // Функция показа уведомления
 function showNotification(message, type = 'info') {
-    // Создаем элемент уведомления
     const notification = document.createElement('div');
     notification.className = `notification ${type}`;
     notification.textContent = message;
     
-    // Добавляем в тело документа
     document.body.appendChild(notification);
     
-    // Показываем с анимацией
     setTimeout(() => notification.classList.add('show'), 100);
     
-    // Автоматически скрываем через 3 секунды
     setTimeout(() => {
         notification.classList.remove('show');
         setTimeout(() => {
@@ -970,6 +1204,11 @@ function cleanup() {
         callTimerInterval = null;
     }
     
+    if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+    }
+    
     callStartTime = null;
     currentRoom = null;
 }
@@ -977,11 +1216,9 @@ function cleanup() {
 // Обработчики для отслеживания закрытия вкладки
 window.addEventListener('beforeunload', async (e) => {
     if (currentRoom) {
-        // Предотвращаем немедленное закрытие для отправки данных
         e.preventDefault();
         e.returnValue = '';
         
-        // Используем sendBeacon для надежной отправки данных при закрытии
         const data = new Blob([JSON.stringify({
             room_number: currentRoom,
             user_id: userId,
@@ -989,8 +1226,6 @@ window.addEventListener('beforeunload', async (e) => {
         })], { type: 'application/json' });
         
         navigator.sendBeacon('/api/leave-room', data);
-        
-        // Также выполняем обычный выход
         await leaveRoom();
     }
 });
@@ -1004,7 +1239,6 @@ window.addEventListener('pagehide', async () => {
 // Обработчик видимости страницы
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
-        // Пользователь вернулся на вкладку
         updateActivity();
     }
 });
@@ -1029,12 +1263,11 @@ if (!checkWebRTCAvailability()) {
     roomForm.querySelector('button').disabled = true;
 }
 
-// Периодическая очистка неактивных комнат (дополнительная страховка)
+// Периодическая очистка неактивных комнат
 setInterval(async () => {
     try {
         const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
         
-        // Удаляем комнаты без активности более 10 минут
         const { error } = await supabase
             .from('rooms')
             .delete()
@@ -1042,7 +1275,6 @@ setInterval(async () => {
         
         if (error) console.error('Ошибка автоматической очистки комнат:', error);
         
-        // Также очищаем старые signaling данные
         await supabase
             .from('signaling')
             .delete()
@@ -1051,6 +1283,6 @@ setInterval(async () => {
     } catch (error) {
         console.error('Ошибка автоматической очистки комнат:', error);
     }
-}, 5 * 60 * 1000); // Проверка каждые 5 минут
+}, 5 * 60 * 1000);
 
 console.log('Online Call App инициализирован');
