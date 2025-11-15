@@ -203,6 +203,18 @@ video {
     background: #ff6b6b;
 }
 
+.control-btn#switch-camera {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+.control-btn#switch-camera:hover {
+    background: rgba(255, 255, 255, 0.3);
+}
+
+.control-btn#switch-camera.active {
+    background: rgba(59, 130, 246, 0.5);
+}
+
 .audio-indicator {
     position: absolute;
     top: 10px;
@@ -438,6 +450,7 @@ video {
     background: rgba(0, 0, 0, 0.5);
     border-radius: 10px;
     overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.3);
 }
 
 .volume-level {
@@ -446,6 +459,7 @@ video {
     width: 100%;
     background: #4ade80;
     transition: height 0.1s ease;
+    border-radius: 8px;
 }
 
 .wave-animation {
@@ -490,6 +504,16 @@ video {
     }
 }
 
+@keyframes cameraSwitch {
+    0% { transform: rotateY(0deg); }
+    50% { transform: rotateY(90deg); }
+    100% { transform: rotateY(0deg); }
+}
+
+.camera-switching {
+    animation: cameraSwitch 0.5s ease-in-out;
+}
+
 .room-info {
     background: rgba(255, 255, 255, 0.1);
     padding: 15px;
@@ -525,6 +549,21 @@ video {
 
 .copy-btn.copied {
     background: #4ade80;
+}
+
+.audio-test-btn {
+    background: rgba(255, 255, 255, 0.2);
+    color: white;
+    border: none;
+    padding: 8px 15px;
+    border-radius: 5px;
+    cursor: pointer;
+    margin-top: 10px;
+    font-size: 0.9rem;
+}
+
+.audio-test-btn:hover {
+    background: rgba(255, 255, 255, 0.3);
 }
 
 @media (max-width: 768px) {
