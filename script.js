@@ -28,6 +28,17 @@ let peerConnection = null;
 let isCaller = false;
 let roomTimeout = null;
 let signalingChannels = [];
+let activityCheckInterval = null;
+let lastActivityTime = Date.now();
+let userId = generateUserId();
+let isUserActive = true;
+let callStartTime = null;
+let callTimerInterval = null;
+
+// Генерация уникального ID пользователя
+function generateUserId() {
+    return 'user_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
+}
 
 // Улучшенная конфигурация STUN/TURN серверов
 const configuration = {
@@ -86,6 +97,60 @@ function initializeApp() {
     roomNumberInput.addEventListener('input', (e) => {
         e.target.value = e.target.value.replace(/\D/g, '').slice(0, 14);
     });
+
+    // Отслеживание активности пользователя
+    setupActivityTracking();
+    
+    // Периодическая очистка неактивных комнат
+    startRoomCleanupInterval();
+}
+
+// Настройка отслеживания активности
+function setupActivityTracking() {
+    // События активности пользователя
+    const activityEvents = ['mousedown', 'mousemove', 'keypress', 'scroll', 'touchstart', 'click'];
+    
+    activityEvents.forEach(event => {
+        document.addEventListener(event, updateActivity, true);
+    });
+
+    // Проверка активности каждые 30 секунд
+    activityCheckInterval = setInterval(checkActivity, 30000);
+}
+
+// Обновление времени активности
+function updateActivity() {
+    lastActivityTime = Date.now();
+    isUserActive = true;
+    
+    // Обновляем активность в комнате если мы в ней
+    if (currentRoom) {
+        updateUserActivity();
+    }
+}
+
+// Проверка активности
+function checkActivity() {
+    const inactiveTime = Date.now() - lastActivityTime;
+    const inactiveThreshold = 5 * 60 * 1000; // 5 минут
+    
+    if (inactiveTime > inactiveThreshold && isUserActive) {
+        isUserActive = false;
+        console.log('Пользователь неактивен более 5 минут');
+        
+        // Если мы в комнате, выходим из нее
+        if (currentRoom) {
+            showError('Вы были неактивны более 5 минут. Комната будет удалена.');
+            endCall();
+        }
+    }
+}
+
+// Запуск периодической очистки комнат
+function startRoomCleanupInterval() {
+    setInterval(async () => {
+        await cleanupInactiveRooms();
+    }, 2 * 60 * 1000); // Проверка каждые 2 минуты
 }
 
 // Функция присоединения к комнате
@@ -93,6 +158,9 @@ async function joinRoom(roomNumber) {
     try {
         currentRoom = roomNumber;
         currentRoomSpan.textContent = roomNumber;
+        
+        // Сначала проверяем и очищаем старые комнаты
+        await cleanupInactiveRooms();
         
         // Проверяем существование комнаты
         const { data: existingRoom, error } = await supabase
@@ -106,14 +174,33 @@ async function joinRoom(roomNumber) {
         }
         
         if (existingRoom) {
-            // Комната существует - присоединяемся как второй участник
-            if (existingRoom.participants >= 2) {
-                showError('Комната уже заполнена. Максимум 2 участника.');
-                return;
+            // Проверяем, не устарела ли комната
+            if (isRoomExpired(existingRoom)) {
+                // Удаляем устаревшую комнату и создаем новую
+                await supabase
+                    .from('rooms')
+                    .delete()
+                    .eq('room_number', roomNumber);
+                
+                // Также очищаем signaling данные
+                await supabase
+                    .from('signaling')
+                    .delete()
+                    .eq('room_number', roomNumber);
+                
+                isCaller = true;
+                await setupMedia();
+                await createNewRoom();
+            } else {
+                // Комната существует - присоединяемся как второй участник
+                if (existingRoom.participants >= 2) {
+                    showError('Комната уже заполнена. Максимум 2 участника.');
+                    return;
+                }
+                isCaller = false;
+                await setupMedia();
+                await joinExistingRoom(existingRoom);
             }
-            isCaller = false;
-            await setupMedia();
-            await joinExistingRoom(existingRoom);
         } else {
             // Комната не существует - создаем новую
             isCaller = true;
@@ -131,6 +218,49 @@ async function joinRoom(roomNumber) {
     }
 }
 
+// Проверка устаревания комнаты
+function isRoomExpired(room) {
+    const lastActivity = new Date(room.last_activity);
+    const now = new Date();
+    const diffMinutes = (now - lastActivity) / (1000 * 60);
+    return diffMinutes > 10; // Комната устарела через 10 минут
+}
+
+// Очистка неактивных комнат
+async function cleanupInactiveRooms() {
+    try {
+        const { data: allRooms, error } = await supabase
+            .from('rooms')
+            .select('*');
+        
+        if (error) throw error;
+        
+        const now = new Date();
+        const cleanupPromises = allRooms.map(async (room) => {
+            const lastActivity = new Date(room.last_activity);
+            const diffMinutes = (now - lastActivity) / (1000 * 60);
+            
+            if (diffMinutes > 10 || room.participants === 0) {
+                console.log('Удаляем неактивную комнату:', room.room_number);
+                await supabase
+                    .from('rooms')
+                    .delete()
+                    .eq('room_number', room.room_number);
+                
+                // Также очищаем signaling данные
+                await supabase
+                    .from('signaling')
+                    .delete()
+                    .eq('room_number', room.room_number);
+            }
+        });
+        
+        await Promise.all(cleanupPromises);
+    } catch (error) {
+        console.error('Ошибка при очистке комнат:', error);
+    }
+}
+
 // Функция создания новой комнаты
 async function createNewRoom() {
     const { data, error } = await supabase
@@ -139,7 +269,9 @@ async function createNewRoom() {
             { 
                 room_number: currentRoom,
                 created_at: new Date().toISOString(),
-                participants: 1
+                participants: 1,
+                last_activity: new Date().toISOString(),
+                user_ids: [userId]
             }
         ])
         .select()
@@ -149,20 +281,62 @@ async function createNewRoom() {
     
     // Подписываемся на изменения комнаты
     subscribeToRoomChanges();
+    
+    // Запускаем мониторинг активности комнаты
+    startRoomActivityMonitoring();
 }
 
 // Функция присоединения к существующей комнате
 async function joinExistingRoom(room) {
-    // Обновляем количество участников
+    // Обновляем количество участников и добавляем пользователя
+    const updatedUserIds = [...(room.user_ids || []), userId];
+    
     const { error } = await supabase
         .from('rooms')
-        .update({ participants: 2 })
+        .update({ 
+            participants: 2,
+            last_activity: new Date().toISOString(),
+            user_ids: updatedUserIds
+        })
         .eq('room_number', currentRoom);
     
     if (error) throw error;
     
     // Подписываемся на изменения комнаты
     subscribeToRoomChanges();
+    
+    // Запускаем мониторинг активности комнаты
+    startRoomActivityMonitoring();
+}
+
+// Мониторинг активности комнаты
+function startRoomActivityMonitoring() {
+    // Обновляем активность каждую минуту
+    const activityInterval = setInterval(async () => {
+        if (currentRoom && isUserActive) {
+            await updateUserActivity();
+        } else {
+            clearInterval(activityInterval);
+        }
+    }, 60000);
+}
+
+// Обновление активности пользователя
+async function updateUserActivity() {
+    if (!currentRoom) return;
+    
+    try {
+        const { error } = await supabase
+            .from('rooms')
+            .update({ 
+                last_activity: new Date().toISOString()
+            })
+            .eq('room_number', currentRoom);
+        
+        if (error) console.error('Ошибка обновления активности:', error);
+    } catch (error) {
+        console.error('Ошибка обновления активности:', error);
+    }
 }
 
 // Функция подписки на изменения комнаты
@@ -185,6 +359,12 @@ function subscribeToRoomChanges() {
                         // Второй участник присоединился - начинаем звонок
                         await startCall();
                     }
+                    
+                    // Проверяем, не удалена ли комната системой очистки
+                    if (payload.new.participants === 0) {
+                        showError('Комната была автоматически удалена из-за неактивности');
+                        endCall();
+                    }
                 } else if (payload.eventType === 'DELETE') {
                     // Комната удалена - завершаем звонок
                     if (callScreen.classList.contains('active')) {
@@ -206,7 +386,7 @@ function subscribeToRoomChanges() {
     signalingChannels.push(roomChannel);
 }
 
-// Функция настройки медиа (камера и микрофон) - ИСПРАВЛЕННАЯ
+// Функция настройки медиа (камера и микрофон)
 async function setupMedia() {
     try {
         // Запрашиваем разрешение только на аудио сначала
@@ -260,10 +440,13 @@ async function setupMedia() {
     }
 }
 
-// Функция начала звонка - ИСПРАВЛЕННАЯ
+// Функция начала звонка
 async function startCall() {
     showScreen(callScreen);
     callRoomSpan.textContent = currentRoom;
+    
+    // Запускаем таймер звонка
+    startCallTimer();
     
     try {
         // Создаем Peer Connection с улучшенной конфигурацией
@@ -280,7 +463,7 @@ async function startCall() {
             peerConnection.addTrack(track, localStream);
         });
 
-        // Обработчик получения удаленного потока - ИСПРАВЛЕННЫЙ
+        // Обработчик получения удаленного потока
         peerConnection.ontrack = (event) => {
             console.log('Получен удаленный поток:', event.streams);
             if (event.streams && event.streams[0]) {
@@ -309,19 +492,14 @@ async function startCall() {
             console.log('Состояние соединения:', peerConnection.connectionState);
             if (peerConnection.connectionState === 'connected') {
                 console.log('Соединение установлено!');
-                showError('Соединение установлено!');
+                showNotification('Соединение установлено!', 'success');
             } else if (peerConnection.connectionState === 'disconnected' || 
                       peerConnection.connectionState === 'failed') {
                 console.log('Соединение прервано');
-                showError('Соединение прервано');
+                showNotification('Соединение прервано', 'error');
                 endCall();
             }
         };
-
-        // Обработчик для отслеживания добавленных треков
-        peerConnection.getSenders().forEach(sender => {
-            console.log('Sender track:', sender.track ? sender.track.kind : 'no track');
-        });
 
         if (isCaller) {
             // Создаем предложение с аудио и видео
@@ -351,6 +529,40 @@ async function startCall() {
         showError('Ошибка при установке соединения: ' + error.message);
         endCall();
     }
+}
+
+// Запуск таймера звонка
+function startCallTimer() {
+    callStartTime = Date.now();
+    updateCallTimer();
+    
+    callTimerInterval = setInterval(updateCallTimer, 1000);
+}
+
+// Обновление таймера звонка
+function updateCallTimer() {
+    if (!callStartTime) return;
+    
+    const elapsed = Date.now() - callStartTime;
+    const minutes = Math.floor(elapsed / 60000);
+    const seconds = Math.floor((elapsed % 60000) / 1000);
+    
+    const timerElement = document.getElementById('call-timer') || createCallTimerElement();
+    timerElement.textContent = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+}
+
+// Создание элемента таймера
+function createCallTimerElement() {
+    const timerElement = document.createElement('div');
+    timerElement.id = 'call-timer';
+    timerElement.className = 'call-timer';
+    timerElement.textContent = '00:00';
+    
+    const callContainer = document.querySelector('.call-container');
+    const roomInfo = callContainer.querySelector('p');
+    roomInfo.appendChild(timerElement);
+    
+    return timerElement;
 }
 
 // Функция сохранения предложения в Supabase
@@ -409,7 +621,7 @@ function listenForOffer() {
     signalingChannels.push(offerChannel);
 }
 
-// Функция обработки предложения - ИСПРАВЛЕННАЯ
+// Функция обработки предложения
 async function handleOffer(offerData) {
     if (!isCaller && peerConnection) {
         try {
@@ -519,7 +731,7 @@ function listenForIceCandidates() {
     signalingChannels.push(iceChannel);
 }
 
-// Функция переключения аудио - ИСПРАВЛЕННАЯ
+// Функция переключения аудио
 function toggleAudio() {
     if (localStream) {
         const audioTracks = localStream.getAudioTracks();
@@ -527,7 +739,15 @@ function toggleAudio() {
             const audioTrack = audioTracks[0];
             audioTrack.enabled = !audioTrack.enabled;
             muteAudioBtn.classList.toggle('muted', !audioTrack.enabled);
+            
+            // Обновляем индикатор на видео
+            const videoWrapper = localVideo.closest('.video-wrapper');
+            if (videoWrapper) {
+                videoWrapper.classList.toggle('audio-muted', !audioTrack.enabled);
+            }
+            
             console.log('Аудио ' + (audioTrack.enabled ? 'включено' : 'выключено'));
+            showNotification(`Микрофон ${audioTrack.enabled ? 'включен' : 'выключен'}`, 'info');
         } else {
             console.log('Аудио треки не найдены');
         }
@@ -542,7 +762,9 @@ function toggleVideo() {
             const videoTrack = videoTracks[0];
             videoTrack.enabled = !videoTrack.enabled;
             muteVideoBtn.classList.toggle('muted', !videoTrack.enabled);
+            
             console.log('Видео ' + (videoTrack.enabled ? 'включено' : 'выключено'));
+            showNotification(`Камера ${videoTrack.enabled ? 'включена' : 'выключена'}`, 'info');
         }
     }
 }
@@ -550,6 +772,13 @@ function toggleVideo() {
 // Функция завершения звонка
 async function endCall() {
     console.log('Завершение звонка');
+    
+    // Останавливаем таймер звонка
+    if (callTimerInterval) {
+        clearInterval(callTimerInterval);
+        callTimerInterval = null;
+    }
+    callStartTime = null;
     
     // Останавливаем медиапотоки
     if (localStream) {
@@ -578,24 +807,32 @@ async function leaveRoom() {
     if (currentRoom) {
         try {
             // Получаем текущее состояние комнаты
-            const { data: room } = await supabase
+            const { data: room, error: fetchError } = await supabase
                 .from('rooms')
-                .select('participants')
+                .select('*')
                 .eq('room_number', currentRoom)
                 .single();
             
-            if (room) {
-                if (room.participants === 1) {
-                    // Удаляем комнату, если остался один участник
+            if (!fetchError && room) {
+                // Убираем текущего пользователя из списка участников
+                const updatedUserIds = (room.user_ids || []).filter(id => id !== userId);
+                const updatedParticipants = Math.max(0, room.participants - 1);
+                
+                if (updatedParticipants === 0) {
+                    // Если участников не осталось - удаляем комнату
                     await supabase
                         .from('rooms')
                         .delete()
                         .eq('room_number', currentRoom);
                 } else {
-                    // Уменьшаем количество участников
+                    // Обновляем комнату с новыми данными
                     await supabase
                         .from('rooms')
-                        .update({ participants: room.participants - 1 })
+                        .update({ 
+                            participants: updatedParticipants,
+                            user_ids: updatedUserIds,
+                            last_activity: new Date().toISOString()
+                        })
                         .eq('room_number', currentRoom);
                 }
             }
@@ -646,13 +883,19 @@ function resetRoomTimeout() {
                     .delete()
                     .eq('room_number', currentRoom);
                 
+                // Также очищаем signaling данные
+                await supabase
+                    .from('signaling')
+                    .delete()
+                    .eq('room_number', currentRoom);
+                
                 showScreen(loginScreen);
                 showError('Время ожидания истекло. Комната удалена.');
             } catch (error) {
                 console.error('Ошибка удаления комнаты по таймауту:', error);
             }
         }
-    }, 5 * 60 * 1000); // 5 минут
+    }, 10 * 60 * 1000); // 10 минут
 }
 
 // Функция показа экрана
@@ -674,6 +917,30 @@ function showError(message) {
     }, 5000);
 }
 
+// Функция показа уведомления
+function showNotification(message, type = 'info') {
+    // Создаем элемент уведомления
+    const notification = document.createElement('div');
+    notification.className = `notification ${type}`;
+    notification.textContent = message;
+    
+    // Добавляем в тело документа
+    document.body.appendChild(notification);
+    
+    // Показываем с анимацией
+    setTimeout(() => notification.classList.add('show'), 100);
+    
+    // Автоматически скрываем через 3 секунды
+    setTimeout(() => {
+        notification.classList.remove('show');
+        setTimeout(() => {
+            if (notification.parentNode) {
+                notification.parentNode.removeChild(notification);
+            }
+        }, 300);
+    }, 3000);
+}
+
 // Функция очистки
 function cleanup() {
     if (localStream) {
@@ -693,13 +960,52 @@ function cleanup() {
         roomTimeout = null;
     }
     
+    if (activityCheckInterval) {
+        clearInterval(activityCheckInterval);
+        activityCheckInterval = null;
+    }
+    
+    if (callTimerInterval) {
+        clearInterval(callTimerInterval);
+        callTimerInterval = null;
+    }
+    
+    callStartTime = null;
     currentRoom = null;
 }
 
-// Обработчик изменения состояния соединения
-window.addEventListener('beforeunload', async () => {
+// Обработчики для отслеживания закрытия вкладки
+window.addEventListener('beforeunload', async (e) => {
+    if (currentRoom) {
+        // Предотвращаем немедленное закрытие для отправки данных
+        e.preventDefault();
+        e.returnValue = '';
+        
+        // Используем sendBeacon для надежной отправки данных при закрытии
+        const data = new Blob([JSON.stringify({
+            room_number: currentRoom,
+            user_id: userId,
+            action: 'leave'
+        })], { type: 'application/json' });
+        
+        navigator.sendBeacon('/api/leave-room', data);
+        
+        // Также выполняем обычный выход
+        await leaveRoom();
+    }
+});
+
+window.addEventListener('pagehide', async () => {
     if (currentRoom) {
         await leaveRoom();
+    }
+});
+
+// Обработчик видимости страницы
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+        // Пользователь вернулся на вкладку
+        updateActivity();
     }
 });
 
@@ -722,3 +1028,29 @@ function checkWebRTCAvailability() {
 if (!checkWebRTCAvailability()) {
     roomForm.querySelector('button').disabled = true;
 }
+
+// Периодическая очистка неактивных комнат (дополнительная страховка)
+setInterval(async () => {
+    try {
+        const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+        
+        // Удаляем комнаты без активности более 10 минут
+        const { error } = await supabase
+            .from('rooms')
+            .delete()
+            .lt('last_activity', tenMinutesAgo);
+        
+        if (error) console.error('Ошибка автоматической очистки комнат:', error);
+        
+        // Также очищаем старые signaling данные
+        await supabase
+            .from('signaling')
+            .delete()
+            .lt('created_at', tenMinutesAgo);
+            
+    } catch (error) {
+        console.error('Ошибка автоматической очистки комнат:', error);
+    }
+}, 5 * 60 * 1000); // Проверка каждые 5 минут
+
+console.log('Online Call App инициализирован');
