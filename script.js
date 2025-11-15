@@ -29,15 +29,26 @@ let isCaller = false;
 let roomTimeout = null;
 let signalingChannels = [];
 
-// Конфигурация STUN/TURN серверов
+// Улучшенная конфигурация STUN/TURN серверов
 const configuration = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
         { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun3.l.google.com:19302' },
-        { urls: 'stun:stun4.l.google.com:19302' }
-    ]
+        { 
+            urls: 'turn:openrelay.metered.ca:80',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        { 
+            urls: 'turn:openrelay.metered.ca:443',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        }
+    ],
+    iceTransportPolicy: 'all',
+    bundlePolicy: 'max-bundle',
+    rtcpMuxPolicy: 'require'
 };
 
 // Инициализация приложения
@@ -195,47 +206,92 @@ function subscribeToRoomChanges() {
     signalingChannels.push(roomChannel);
 }
 
-// Функция настройки медиа (камера и микрофон)
+// Функция настройки медиа (камера и микрофон) - ИСПРАВЛЕННАЯ
 async function setupMedia() {
     try {
-        localStream = await navigator.mediaDevices.getUserMedia({
+        // Запрашиваем разрешение только на аудио сначала
+        const audioStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                channelCount: 1,
+                sampleRate: 48000,
+                sampleSize: 16
+            },
+            video: false
+        });
+
+        // Затем запрашиваем видео
+        const videoStream = await navigator.mediaDevices.getUserMedia({
             video: {
                 width: { ideal: 1280 },
                 height: { ideal: 720 },
                 frameRate: { ideal: 30 }
-            },
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true
             }
         });
+
+        // Объединяем потоки
+        localStream = new MediaStream([
+            ...audioStream.getAudioTracks(),
+            ...videoStream.getVideoTracks()
+        ]);
+
         localVideo.srcObject = localStream;
+        
+        console.log('Аудио треки:', localStream.getAudioTracks());
+        console.log('Видео треки:', localStream.getVideoTracks());
+        
     } catch (error) {
         console.error('Ошибка доступа к медиаустройствам:', error);
-        showError('Не удалось получить доступ к камере и микрофону. Пожалуйста, разрешите доступ и обновите страницу.');
-        throw error;
+        
+        // Пробуем получить только аудио
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+                audio: true,
+                video: false
+            });
+            localVideo.srcObject = localStream;
+            showError('Видео недоступно, но аудио работает');
+        } catch (audioError) {
+            showError('Не удалось получить доступ к камере и микрофону. Пожалуйста, разрешите доступ и обновите страницу.');
+            throw error;
+        }
     }
 }
 
-// Функция начала звонка
+// Функция начала звонка - ИСПРАВЛЕННАЯ
 async function startCall() {
     showScreen(callScreen);
     callRoomSpan.textContent = currentRoom;
     
     try {
-        // Создаем Peer Connection
+        // Создаем Peer Connection с улучшенной конфигурацией
         peerConnection = new RTCPeerConnection(configuration);
         
-        // Добавляем локальный поток
+        // Критически важные обработчики для аудио
+        peerConnection.onnegotiationneeded = async () => {
+            console.log('Требуется переnegotiation');
+        };
+
+        // Добавляем локальный поток с проверкой треков
         localStream.getTracks().forEach(track => {
+            console.log('Добавляем трек:', track.kind, track.id, track.enabled);
             peerConnection.addTrack(track, localStream);
         });
-        
-        // Обработчик получения удаленного потока
+
+        // Обработчик получения удаленного потока - ИСПРАВЛЕННЫЙ
         peerConnection.ontrack = (event) => {
-            console.log('Получен удаленный поток');
-            remoteVideo.srcObject = event.streams[0];
+            console.log('Получен удаленный поток:', event.streams);
+            if (event.streams && event.streams[0]) {
+                remoteVideo.srcObject = event.streams[0];
+                
+                // Принудительно включаем звук для удаленного видео
+                remoteVideo.volume = 1.0;
+                remoteVideo.muted = false;
+                
+                console.log('Удаленные треки:', event.streams[0].getTracks());
+            }
         };
         
         // Обработчик ICE кандидатов
@@ -243,6 +299,8 @@ async function startCall() {
             if (event.candidate) {
                 console.log('Новый ICE кандидат');
                 saveIceCandidate(event.candidate);
+            } else {
+                console.log('Все ICE кандидаты собраны');
             }
         };
         
@@ -251,6 +309,7 @@ async function startCall() {
             console.log('Состояние соединения:', peerConnection.connectionState);
             if (peerConnection.connectionState === 'connected') {
                 console.log('Соединение установлено!');
+                showError('Соединение установлено!');
             } else if (peerConnection.connectionState === 'disconnected' || 
                       peerConnection.connectionState === 'failed') {
                 console.log('Соединение прервано');
@@ -258,13 +317,20 @@ async function startCall() {
                 endCall();
             }
         };
-        
+
+        // Обработчик для отслеживания добавленных треков
+        peerConnection.getSenders().forEach(sender => {
+            console.log('Sender track:', sender.track ? sender.track.kind : 'no track');
+        });
+
         if (isCaller) {
-            // Создаем предложение
+            // Создаем предложение с аудио и видео
             const offer = await peerConnection.createOffer({
                 offerToReceiveAudio: true,
                 offerToReceiveVideo: true
             });
+            
+            console.log('Создан offer:', offer.type);
             await peerConnection.setLocalDescription(offer);
             
             // Сохраняем предложение в Supabase
@@ -343,17 +409,23 @@ function listenForOffer() {
     signalingChannels.push(offerChannel);
 }
 
-// Функция обработки предложения
+// Функция обработки предложения - ИСПРАВЛЕННАЯ
 async function handleOffer(offerData) {
     if (!isCaller && peerConnection) {
         try {
+            console.log('Обрабатываем полученное предложение');
+            
             await peerConnection.setRemoteDescription({
                 type: 'offer',
                 sdp: offerData.sdp
             });
             
-            // Создаем ответ
-            const answer = await peerConnection.createAnswer();
+            // Создаем ответ с обязательным аудио
+            const answer = await peerConnection.createAnswer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true
+            });
+            
             await peerConnection.setLocalDescription(answer);
             
             // Сохраняем ответ в Supabase
@@ -368,6 +440,8 @@ async function handleOffer(offerData) {
                 ]);
             
             if (error) throw error;
+            
+            console.log('Ответ отправлен');
             
         } catch (error) {
             console.error('Ошибка обработки предложения:', error);
@@ -391,10 +465,15 @@ function listenForAnswer() {
             async (payload) => {
                 console.log('Получен ответ');
                 if (peerConnection) {
-                    await peerConnection.setRemoteDescription({
-                        type: 'answer',
-                        sdp: payload.new.sdp
-                    });
+                    try {
+                        await peerConnection.setRemoteDescription({
+                            type: 'answer',
+                            sdp: payload.new.sdp
+                        });
+                        console.log('Удаленное описание установлено');
+                    } catch (error) {
+                        console.error('Ошибка установки remote description:', error);
+                    }
                 }
             }
         )
@@ -421,7 +500,7 @@ function listenForIceCandidates() {
             },
             async (payload) => {
                 console.log('Получен ICE кандидат');
-                if (peerConnection) {
+                if (peerConnection && peerConnection.remoteDescription) {
                     try {
                         const candidate = JSON.parse(payload.new.candidate);
                         await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
@@ -440,13 +519,17 @@ function listenForIceCandidates() {
     signalingChannels.push(iceChannel);
 }
 
-// Функция переключения аудио
+// Функция переключения аудио - ИСПРАВЛЕННАЯ
 function toggleAudio() {
     if (localStream) {
-        const audioTrack = localStream.getAudioTracks()[0];
-        if (audioTrack) {
+        const audioTracks = localStream.getAudioTracks();
+        if (audioTracks.length > 0) {
+            const audioTrack = audioTracks[0];
             audioTrack.enabled = !audioTrack.enabled;
             muteAudioBtn.classList.toggle('muted', !audioTrack.enabled);
+            console.log('Аудио ' + (audioTrack.enabled ? 'включено' : 'выключено'));
+        } else {
+            console.log('Аудио треки не найдены');
         }
     }
 }
@@ -454,10 +537,12 @@ function toggleAudio() {
 // Функция переключения видео
 function toggleVideo() {
     if (localStream) {
-        const videoTrack = localStream.getVideoTracks()[0];
-        if (videoTrack) {
+        const videoTracks = localStream.getVideoTracks();
+        if (videoTracks.length > 0) {
+            const videoTrack = videoTracks[0];
             videoTrack.enabled = !videoTrack.enabled;
             muteVideoBtn.classList.toggle('muted', !videoTrack.enabled);
+            console.log('Видео ' + (videoTrack.enabled ? 'включено' : 'выключено'));
         }
     }
 }
@@ -468,7 +553,10 @@ async function endCall() {
     
     // Останавливаем медиапотоки
     if (localStream) {
-        localStream.getTracks().forEach(track => track.stop());
+        localStream.getTracks().forEach(track => {
+            track.stop();
+            console.log('Остановлен трек:', track.kind);
+        });
         localStream = null;
     }
     
@@ -615,10 +703,22 @@ window.addEventListener('beforeunload', async () => {
     }
 });
 
-// Обработчик изменения видимости страницы
-document.addEventListener('visibilitychange', () => {
-    if (document.hidden && currentRoom) {
-        // Страница скрыта - можно добавить логику паузы
-        console.log('Страница скрыта');
+// Проверка поддержки WebRTC
+function checkWebRTCAvailability() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showError('Ваш браузер не поддерживает WebRTC или доступ к медиаустройствам');
+        return false;
     }
-});
+    
+    if (!window.RTCPeerConnection) {
+        showError('Ваш браузер не поддерживает WebRTC');
+        return false;
+    }
+    
+    return true;
+}
+
+// Инициализация проверки WebRTC
+if (!checkWebRTCAvailability()) {
+    roomForm.querySelector('button').disabled = true;
+}
