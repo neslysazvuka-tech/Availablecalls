@@ -69,6 +69,11 @@ document.addEventListener('DOMContentLoaded', () => {
 function initializeApp() {
     console.log('Инициализация приложения...');
     
+    // Проверка подключения к Supabase
+    supabase.from('rooms').select('count', { count: 'exact', head: true })
+        .then(() => console.log('Подключение к Supabase: OK'))
+        .catch(error => console.error('Подключение к Supabase: ERROR', error));
+
     roomForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         console.log('Форма отправлена');
@@ -319,72 +324,287 @@ function updateSwitchCameraButton() {
     }
 }
 
-// Функция присоединения к комнате
+// Функция присоединения к комнате - ПЕРЕПИСАННАЯ
 async function joinRoom(roomNumber) {
     try {
-        console.log('Присоединяемся к комнате:', roomNumber);
+        console.log('=== НАЧАЛО ПРИСОЕДИНЕНИЯ К КОМНАТЕ ===');
+        console.log('Номер комнаты:', roomNumber);
+        
         currentRoom = roomNumber;
         currentRoomSpan.textContent = roomNumber;
-        
-        // Показываем экран ожидания сразу
+
+        // 1. Сразу показываем экран ожидания
+        console.log('Показываем экран ожидания...');
         showScreen(waitingScreen);
-        
-        await cleanupInactiveRooms();
-        
+
+        // 2. Настраиваем медиаустройства
+        console.log('Настраиваем медиаустройства...');
+        await setupMedia();
+        console.log('Медиаустройства настроены');
+
+        // 3. Проверяем существование комнаты
+        console.log('Проверяем существование комнаты в БД...');
         const { data: existingRoom, error } = await supabase
             .from('rooms')
             .select('*')
             .eq('room_number', roomNumber)
             .single();
-        
-        console.log('Результат проверки комнаты:', existingRoom, error);
-        
-        if (error && error.code !== 'PGRST116') {
-            throw error;
-        }
-        
-        if (existingRoom) {
-            console.log('Комната существует:', existingRoom);
-            if (isRoomExpired(existingRoom)) {
-                console.log('Комната устарела, удаляем и создаем новую');
-                await supabase
-                    .from('rooms')
-                    .delete()
-                    .eq('room_number', roomNumber);
-                
-                await supabase
-                    .from('signaling')
-                    .delete()
-                    .eq('room_number', roomNumber);
-                
+
+        console.log('Результат запроса комнаты:', { existingRoom, error });
+
+        if (error) {
+            if (error.code === 'PGRST116') {
+                // Комната не существует - создаем новую
+                console.log('Комната не существует, создаем новую...');
                 isCaller = true;
-                await setupMedia();
                 await createNewRoom();
+                console.log('Новая комната создана, ждем второго участника...');
             } else {
-                console.log('Присоединяемся к существующей комнате');
-                if (existingRoom.participants >= 2) {
-                    showError('Комната уже заполнена. Максимум 2 участника.');
-                    showScreen(loginScreen);
-                    return;
-                }
-                isCaller = false;
-                await setupMedia();
-                await joinExistingRoom(existingRoom);
+                throw error;
             }
         } else {
-            console.log('Комната не существует, создаем новую');
-            isCaller = true;
-            await setupMedia();
-            await createNewRoom();
+            // Комната существует
+            console.log('Комната существует:', existingRoom);
+            
+            if (existingRoom.participants >= 2) {
+                showError('Комната уже заполнена. Максимум 2 участника.');
+                showScreen(loginScreen);
+                return;
+            }
+
+            if (isRoomExpired(existingRoom)) {
+                console.log('Комната устарела, удаляем и создаем новую...');
+                await supabase.from('rooms').delete().eq('room_number', roomNumber);
+                await supabase.from('signaling').delete().eq('room_number', roomNumber);
+                
+                isCaller = true;
+                await createNewRoom();
+            } else {
+                // Присоединяемся к существующей комнате
+                console.log('Присоединяемся к существующей комнате...');
+                isCaller = false;
+                await joinExistingRoom(existingRoom);
+            }
         }
-        
+
+        // 4. Сбрасываем таймаут комнаты
         resetRoomTimeout();
-        
+        console.log('=== ПРИСОЕДИНЕНИЕ УСПЕШНО ЗАВЕРШЕНО ===');
+
     } catch (error) {
-        console.error('Ошибка при присоединении к комнате:', error);
+        console.error('!!! ОШИБКА ПРИ ПРИСОЕДИНЕНИИ К КОМНАТЕ !!!', error);
         showError('Не удалось присоединиться к комнате: ' + error.message);
         showScreen(loginScreen);
         cleanup();
+    }
+}
+
+// Функция создания новой комнаты - УПРОЩЕННАЯ
+async function createNewRoom() {
+    console.log('Создаем новую комнату в БД...');
+    const { data, error } = await supabase
+        .from('rooms')
+        .insert([
+            { 
+                room_number: currentRoom,
+                created_at: new Date().toISOString(),
+                participants: 1,
+                last_activity: new Date().toISOString(),
+                user_ids: [userId]
+            }
+        ])
+        .select()
+        .single();
+
+    if (error) {
+        console.error('Ошибка создания комнаты:', error);
+        throw error;
+    }
+
+    console.log('Комната создана:', data);
+    
+    // Подписываемся на изменения комнаты
+    subscribeToRoomChanges();
+    console.log('Подписка на изменения комнаты установлена');
+}
+
+// Функция присоединения к существующей комнате - УПРОЩЕННАЯ
+async function joinExistingRoom(room) {
+    console.log('Обновляем комнату для присоединения второго участника...');
+    
+    const updatedUserIds = [...(room.user_ids || []), userId];
+    
+    const { error } = await supabase
+        .from('rooms')
+        .update({ 
+            participants: 2,
+            last_activity: new Date().toISOString(),
+            user_ids: updatedUserIds
+        })
+        .eq('room_number', currentRoom);
+
+    if (error) {
+        console.error('Ошибка обновления комнаты:', error);
+        throw error;
+    }
+
+    console.log('Комната обновлена, участников: 2');
+    
+    // Подписываемся на изменения комнаты
+    subscribeToRoomChanges();
+    
+    // НЕМЕДЛЕННО начинаем звонок, так как мы второй участник
+    console.log('Немедленно начинаем звонок как второй участник...');
+    await startCall();
+}
+
+// Функция настройки медиа - УПРОЩЕННАЯ
+async function setupMedia() {
+    try {
+        console.log('Запрашиваем доступ к камере и микрофону...');
+        
+        localStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+            },
+            video: {
+                width: { ideal: 640 },
+                height: { ideal: 480 },
+                frameRate: { ideal: 24 }
+            }
+        });
+
+        console.log('Медиаустройства получены успешно');
+        
+        // Настраиваем локальное видео
+        localVideo.srcObject = localStream;
+        localVideo.muted = true;
+        
+        console.log('Локальное видео настроено');
+
+    } catch (error) {
+        console.error('Ошибка доступа к медиаустройствам:', error);
+        
+        // Пробуем получить только аудио
+        try {
+            console.log('Пробуем получить только аудио...');
+            localStream = await navigator.mediaDevices.getUserMedia({
+                audio: true,
+                video: false
+            });
+            
+            localVideo.srcObject = localStream;
+            localVideo.muted = true;
+            
+            console.log('Только аудио получено успешно');
+            showNotification('Видео недоступно, но аудио работает', 'warning');
+            
+        } catch (audioError) {
+            console.error('Не удалось получить доступ к микрофону:', audioError);
+            throw new Error('Не удалось получить доступ к камере и микрофону');
+        }
+    }
+}
+
+// Функция подписки на изменения комнаты - УПРОЩЕННАЯ
+function subscribeToRoomChanges() {
+    console.log('Настраиваем подписку на изменения комнаты...');
+    
+    const roomChannel = supabase
+        .channel(`room-${currentRoom}`)
+        .on(
+            'postgres_changes',
+            {
+                event: '*',
+                schema: 'public',
+                table: 'rooms',
+                filter: `room_number=eq.${currentRoom}`
+            },
+            async (payload) => {
+                console.log('Получено изменение комнаты:', payload);
+                
+                if (payload.eventType === 'UPDATE') {
+                    console.log('Комната обновлена:', payload.new);
+                    
+                    // Если мы создатель комнаты и появился второй участник
+                    if (payload.new.participants === 2 && isCaller) {
+                        console.log('Второй участник присоединился! Начинаем звонок...');
+                        await startCall();
+                    }
+                }
+            }
+        )
+        .subscribe((status) => {
+            console.log('Статус подписки на комнату:', status);
+        });
+    
+    signalingChannels.push(roomChannel);
+}
+
+// Функция начала звонка - УПРОЩЕННАЯ
+async function startCall() {
+    console.log('=== НАЧАЛО ЗВОНКА ===');
+    
+    // 1. Показываем экран звонка
+    showScreen(callScreen);
+    callRoomSpan.textContent = currentRoom;
+    console.log('Экран звонка показан');
+
+    // 2. Запускаем таймер
+    startCallTimer();
+    console.log('Таймер звонка запущен');
+
+    try {
+        // 3. Создаем PeerConnection
+        peerConnection = new RTCPeerConnection(configuration);
+        console.log('PeerConnection создан');
+
+        // 4. Добавляем локальные треки
+        localStream.getTracks().forEach(track => {
+            peerConnection.addTrack(track, localStream);
+            console.log('Добавлен трек:', track.kind);
+        });
+
+        // 5. Обработчик удаленного потока
+        peerConnection.ontrack = (event) => {
+            console.log('Получен удаленный поток');
+            if (event.streams[0]) {
+                remoteVideo.srcObject = event.streams[0];
+                remoteVideo.play().catch(console.error);
+                console.log('Удаленное видео настроено');
+            }
+        };
+
+        // 6. Обработчик ICE кандидатов
+        peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+                saveIceCandidate(event.candidate);
+            }
+        };
+
+        if (isCaller) {
+            // Создаем предложение
+            console.log('Создаем offer как создатель комнаты...');
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            await saveOffer(offer);
+            listenForAnswer();
+            console.log('Offer создан и сохранен');
+        } else {
+            // Слушаем предложение
+            console.log('Слушаем offer как второй участник...');
+            listenForOffer();
+        }
+        
+        listenForIceCandidates();
+        console.log('=== ЗВОНОК УСПЕШНО НАЧАТ ===');
+
+    } catch (error) {
+        console.error('!!! ОШИБКА НАЧАЛА ЗВОНКА !!!', error);
+        showError('Ошибка при установке соединения');
+        endCall();
     }
 }
 
@@ -430,60 +650,6 @@ async function cleanupInactiveRooms() {
     }
 }
 
-// Функция создания новой комнаты
-async function createNewRoom() {
-    console.log('Создаем новую комнату:', currentRoom);
-    const { data, error } = await supabase
-        .from('rooms')
-        .insert([
-            { 
-                room_number: currentRoom,
-                created_at: new Date().toISOString(),
-                participants: 1,
-                last_activity: new Date().toISOString(),
-                user_ids: [userId]
-            }
-        ])
-        .select()
-        .single();
-    
-    if (error) {
-        console.error('Ошибка создания комнаты:', error);
-        throw error;
-    }
-    
-    console.log('Комната создана:', data);
-    subscribeToRoomChanges();
-    startRoomActivityMonitoring();
-}
-
-// Функция присоединения к существующей комнате
-async function joinExistingRoom(room) {
-    console.log('Присоединяемся к существующей комнате:', room);
-    const updatedUserIds = [...(room.user_ids || []), userId];
-    
-    const { error } = await supabase
-        .from('rooms')
-        .update({ 
-            participants: 2,
-            last_activity: new Date().toISOString(),
-            user_ids: updatedUserIds
-        })
-        .eq('room_number', currentRoom);
-    
-    if (error) {
-        console.error('Ошибка обновления комнаты:', error);
-        throw error;
-    }
-    
-    console.log('Комната обновлена, участников: 2');
-    subscribeToRoomChanges();
-    startRoomActivityMonitoring();
-    
-    // Если мы присоединяемся как второй участник, сразу начинаем звонок
-    await startCall();
-}
-
 // Мониторинг активности комнаты
 function startRoomActivityMonitoring() {
     const activityInterval = setInterval(async () => {
@@ -510,267 +676,6 @@ async function updateUserActivity() {
         if (error) console.error('Ошибка обновления активности:', error);
     } catch (error) {
         console.error('Ошибка обновления активности:', error);
-    }
-}
-
-// Функция подписки на изменения комнаты
-function subscribeToRoomChanges() {
-    console.log('Подписываемся на изменения комнаты:', currentRoom);
-    
-    const roomChannel = supabase
-        .channel(`room-${currentRoom}`)
-        .on(
-            'postgres_changes',
-            {
-                event: '*',
-                schema: 'public',
-                table: 'rooms',
-                filter: `room_number=eq.${currentRoom}`
-            },
-            async (payload) => {
-                console.log('Изменение в комнате:', payload);
-                
-                if (payload.eventType === 'UPDATE') {
-                    console.log('Комната обновлена:', payload.new);
-                    
-                    if (payload.new.participants === 2 && isCaller) {
-                        console.log('Второй участник присоединился, начинаем звонок');
-                        await startCall();
-                    }
-                    
-                    if (payload.new.participants === 0) {
-                        showError('Комната была автоматически удалена из-за неактивности');
-                        endCall();
-                    }
-                } else if (payload.eventType === 'DELETE') {
-                    console.log('Комната удалена');
-                    if (callScreen.classList.contains('active')) {
-                        showError('Комната была удалена');
-                        endCall();
-                    } else {
-                        showError('Комната была удалена');
-                        showScreen(loginScreen);
-                    }
-                }
-            }
-        )
-        .subscribe((status) => {
-            console.log('Статус подписки на комнату:', status);
-            if (status === 'SUBSCRIBED') {
-                console.log('Успешно подписались на изменения комнаты');
-            }
-        });
-    
-    signalingChannels.push(roomChannel);
-}
-
-// Функция настройки медиа
-async function setupMedia() {
-    try {
-        console.log('Настраиваем медиаустройства...');
-        
-        availableCameras = await getAvailableCameras();
-        console.log('Доступные камеры:', availableCameras.length);
-        
-        localStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true,
-                channelCount: 1,
-                sampleRate: 48000
-            },
-            video: {
-                facingMode: 'user',
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
-                frameRate: { ideal: 30 }
-            }
-        });
-
-        currentVideoTrack = localStream.getVideoTracks()[0];
-        currentCamera = 'user';
-        
-        console.log('Медиаустройства получены успешно');
-
-        localVideo.srcObject = localStream;
-        localVideo.muted = true;
-        localVideo.volume = 0;
-        
-        updateSwitchCameraButton();
-        
-        if (availableCameras.length > 1 && switchCameraBtn) {
-            switchCameraBtn.style.display = 'flex';
-        } else if (switchCameraBtn) {
-            switchCameraBtn.style.display = 'none';
-        }
-        
-        setupVolumeMeter();
-        
-        console.log('Медиаустройства настроены');
-        
-    } catch (error) {
-        console.error('Ошибка доступа к медиаустройствам:', error);
-        
-        try {
-            console.log('Пробуем получить только аудио...');
-            localStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true
-                },
-                video: false
-            });
-            
-            localVideo.srcObject = localStream;
-            localVideo.muted = true;
-            localVideo.volume = 0;
-            
-            if (switchCameraBtn) {
-                switchCameraBtn.style.display = 'none';
-            }
-            
-            setupVolumeMeter();
-            
-            showError('Видео недоступно, но аудио работает');
-        } catch (audioError) {
-            console.error('Не удалось получить доступ к микрофону:', audioError);
-            showError('Не удалось получить доступ к камере и микрофону. Пожалуйста, разрешите доступ и обновите страницу.');
-            throw error;
-        }
-    }
-}
-
-// Настройка визуализатора громкости
-function setupVolumeMeter() {
-    try {
-        audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        const source = audioContext.createMediaStreamSource(localStream);
-        volumeAnalyser = audioContext.createAnalyser();
-        volumeAnalyser.fftSize = 256;
-        source.connect(volumeAnalyser);
-        
-        updateVolumeMeter();
-    } catch (error) {
-        console.warn('Не удалось настроить визуализатор громкости:', error);
-    }
-}
-
-// Обновление индикатора громкости
-function updateVolumeMeter() {
-    if (!volumeAnalyser) return;
-    
-    const dataArray = new Uint8Array(volumeAnalyser.frequencyBinCount);
-    volumeAnalyser.getByteFrequencyData(dataArray);
-    
-    let sum = 0;
-    for (let i = 0; i < dataArray.length; i++) {
-        sum += dataArray[i];
-    }
-    const average = sum / dataArray.length;
-    
-    const volumeLevel = document.querySelector('.volume-level');
-    if (volumeLevel) {
-        const height = Math.min(100, (average / 128) * 100);
-        volumeLevel.style.height = height + '%';
-        volumeLevel.style.background = height > 50 ? '#4ade80' : height > 20 ? '#f59e0b' : '#ef4444';
-    }
-    
-    requestAnimationFrame(updateVolumeMeter);
-}
-
-// Функция начала звонка
-async function startCall() {
-    console.log('Начинаем звонок...');
-    showScreen(callScreen);
-    callRoomSpan.textContent = currentRoom;
-    
-    startCallTimer();
-    
-    try {
-        peerConnection = new RTCPeerConnection(configuration);
-        
-        peerConnection.onnegotiationneeded = async () => {
-            console.log('Требуется переnegotiation');
-        };
-
-        localStream.getTracks().forEach(track => {
-            console.log('Добавляем трек в PeerConnection:', track.kind, track.id);
-            peerConnection.addTrack(track, localStream);
-        });
-
-        peerConnection.ontrack = (event) => {
-            console.log('Получен удаленный поток:', event.streams);
-            
-            if (event.streams && event.streams[0]) {
-                const remoteStream = event.streams[0];
-                remoteVideo.srcObject = remoteStream;
-                
-                remoteVideo.muted = false;
-                remoteVideo.volume = 1.0;
-                remoteVideo.setAttribute('playsinline', 'true');
-                
-                remoteVideo.play().then(() => {
-                    console.log('Удаленное видео запущено успешно');
-                    showNotification('Соединение установлено!', 'success');
-                }).catch(error => {
-                    console.error('Ошибка воспроизведения удаленного видео:', error);
-                    remoteVideo.muted = true;
-                    remoteVideo.play().then(() => {
-                        console.log('Удаленное видео запущено в muted режиме');
-                    });
-                });
-                
-                const audioTracks = remoteStream.getAudioTracks();
-                console.log('Аудио треки в удаленном потоке:', audioTracks);
-            }
-        };
-        
-        peerConnection.onicecandidate = (event) => {
-            if (event.candidate) {
-                console.log('Новый ICE кандидат');
-                saveIceCandidate(event.candidate);
-            } else {
-                console.log('Все ICE кандидаты собраны');
-            }
-        };
-        
-        peerConnection.onconnectionstatechange = (event) => {
-            console.log('Состояние соединения:', peerConnection.connectionState);
-            if (peerConnection.connectionState === 'connected') {
-                console.log('PeerConnection соединен!');
-                showNotification('Соединение установлено!', 'success');
-            } else if (peerConnection.connectionState === 'disconnected' || 
-                      peerConnection.connectionState === 'failed') {
-                console.log('Соединение прервано');
-                showNotification('Соединение прервано', 'error');
-                endCall();
-            }
-        };
-
-        if (isCaller) {
-            console.log('Создаем offer...');
-            const offer = await peerConnection.createOffer({
-                offerToReceiveAudio: true,
-                offerToReceiveVideo: true
-            });
-            
-            console.log('Offer создан, устанавливаем local description...');
-            await peerConnection.setLocalDescription(offer);
-            
-            await saveOffer(offer);
-            listenForAnswer();
-        } else {
-            listenForOffer();
-        }
-        
-        listenForIceCandidates();
-        
-    } catch (error) {
-        console.error('Ошибка при начале звонка:', error);
-        showError('Ошибка при установке соединения: ' + error.message);
-        endCall();
     }
 }
 
@@ -873,11 +778,7 @@ async function handleOffer(offerData) {
                 sdp: offerData.sdp
             });
             
-            const answer = await peerConnection.createAnswer({
-                offerToReceiveAudio: true,
-                offerToReceiveVideo: true
-            });
-            
+            const answer = await peerConnection.createAnswer();
             await peerConnection.setLocalDescription(answer);
             
             const { error } = await supabase
